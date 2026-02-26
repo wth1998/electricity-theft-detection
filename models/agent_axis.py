@@ -424,9 +424,7 @@ class H3_Agent_AXIS(nn.Module):
             # 处理Qwen3的思考模式输出（去除<think>标签内容）
             response_texts = []
             for text in response_texts_raw:
-                # 去除 <think>...</think> 及其内容
-                import re
-
+                # 去除 <think>...</think> 及其内容（re已在文件顶部导入）
                 text_clean = re.sub(
                     r"<think>.*?</think>", "", text, flags=re.DOTALL
                 ).strip()
@@ -522,10 +520,6 @@ class H3_Agent_AXIS(nn.Module):
 
                 # 基于生成文本的判断（更可靠）
                 response_text = response_texts[i] if i < len(response_texts) else ""
-
-                # 使用正则表达式检查文本内容
-                text_theft_prob = 0.5
-                matched_pattern = None
 
                 # 使用正则表达式检查文本内容
                 text_theft_prob = 0.5

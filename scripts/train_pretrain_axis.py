@@ -53,14 +53,18 @@ class ElectricityDatasetPretrain(ElectricityDatasetAXIS):
         if use_first_n is not None and use_first_n < len(self.df):
             print(f"[预训练] 按顺序使用前 {use_first_n}/{len(self.df)} 条数据")
             self.df = self.df.iloc[:use_first_n].reset_index(drop=True)
-            self.user_ids = self.df.iloc[:, 0].values.astype(str)
+            self.user_ids = self.df.iloc[:, self.id_idx].values.astype(
+                str
+            )  # 【修复】使用动态索引
             self.data_values = self.data_values[:use_first_n]
         # 方式2: 随机采样（用于快速实验）
         elif max_samples is not None and max_samples < len(self.df):
             print(f"[预训练] 随机采样 {max_samples}/{len(self.df)} 条数据")
             indices = torch.randperm(len(self.df))[:max_samples].numpy()
             self.df = self.df.iloc[indices].reset_index(drop=True)
-            self.user_ids = self.df.iloc[:, 0].values.astype(str)
+            self.user_ids = self.df.iloc[:, self.id_idx].values.astype(
+                str
+            )  # 【修复】使用动态索引
             self.data_values = self.data_values[indices]
 
     def __getitem__(self, idx):
@@ -241,11 +245,17 @@ def pretrain_model(
                 optimizer.step()
                 optimizer.zero_grad()
 
-            # 记录损失
-            total_loss += loss.item() * accumulation_steps
-            total_recon_loss += recon_loss.item()
+            # 记录损失（所有损失都统一除以accumulation_steps以保持统计一致性）
+            total_loss += (
+                loss.item() * accumulation_steps
+            )  # loss已经是除以accumulation_steps的，所以乘回来
+            total_recon_loss += (
+                recon_loss.item() / accumulation_steps
+            )  # 【修复】统一缩放
             if isinstance(anomaly_loss, torch.Tensor):
-                total_anomaly_loss += anomaly_loss.item()
+                total_anomaly_loss += (
+                    anomaly_loss.item() / accumulation_steps
+                )  # 【修复】统一缩放
             num_batches += 1
 
             if (batch_idx + 1) % 50 == 0:

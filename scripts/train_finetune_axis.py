@@ -456,14 +456,9 @@ def finetune_model(
         avg_loss = total_loss / len(train_loader)
         current_lr = optimizer.param_groups[0]["lr"]
 
-        print(f"\n=== Epoch {epoch} 完成 ===")
-        print(f"  训练 Loss: {avg_loss:.4f}")
-        print(f"  验证 Loss: {avg_val_loss:.4f}")
-        print(f"  学习率: {current_lr:.2e}")
-        current_lr = optimizer.param_groups[0]["lr"]
-
+        # 【修复】删除重复的打印和lr获取
         print(
-            f"\n=== Epoch {epoch} 完成 | Avg Loss: {avg_loss:.4f} | LR: {current_lr:.2e} ==="
+            f"\n=== Epoch {epoch} 完成 | Train Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {current_lr:.2e} ==="
         )
 
         history.append(

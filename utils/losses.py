@@ -61,7 +61,9 @@ class FocalLoss(nn.Module):
                 torch.tensor(1 - self.alpha, device=inputs.device),
             )
         else:
-            alpha_t = self.alpha
+            alpha_t = torch.tensor(
+                self.alpha, device=inputs.device
+            )  # 【修复】统一为tensor
 
         # Focal Loss = alpha_t * (1-pt)^gamma * ce_loss
         focal_loss = alpha_t * (1 - pt) ** self.gamma * ce_loss
