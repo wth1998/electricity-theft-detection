@@ -14,6 +14,9 @@ import numpy as np
 import pandas as pd
 import random
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
+from torch.utils.tensorboard import SummaryWriter
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.main_axis_improved import (
@@ -23,6 +26,8 @@ from models.main_axis_improved import (
 )
 from models.agent_axis import H3_Agent_AXIS
 from utils.seed_utils import set_seed, seed_worker
+from utils.losses import FocalLoss, CombinedLoss
+from utils.metrics import TheftDetectionMetrics
 
 
 class ElectricityDatasetWithLabel(ElectricityDatasetAXIS):
@@ -95,6 +100,85 @@ def split_users_by_ratio(csv_file, train_ratio=0.7, seed=42):
     return train_users, val_users
 
 
+def evaluate_on_validation(agent, val_loader, device, max_batches=None):
+    """
+    在验证集上评估模型性能
+
+    返回各项指标：AUC、MAP@40、WF1、F1_Theft等
+    """
+    agent.eval()
+    metrics = TheftDetectionMetrics()
+
+    all_scores = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            if max_batches and batch_idx >= max_batches:
+                break
+
+            targets = batch["label"].to(device)
+            target_texts = ["Theft" if t == 1 else "Normal" for t in targets]
+            instructions = ["Analyze this user's electricity usage pattern."] * len(
+                targets
+            )
+
+            # 推理
+            responses, _, theft_scores = agent.generate(
+                batch, instructions, return_scores=True, debug=False
+            )
+
+            # 解析预测结果
+            for i in range(len(targets)):
+                true_label = "Theft" if targets[i] == 1 else "Normal"
+                pred_text = responses[i].strip().lower()
+                pred_label = "Theft" if "theft" in pred_text else "Normal"
+                score = theft_scores[i] if theft_scores else 0.5
+
+                metrics.update(
+                    true_label, pred_label, score, user_id=batch_idx * len(targets) + i
+                )
+                all_scores.append(score)
+                all_labels.append(targets[i].item())
+
+    results = metrics.compute()
+
+    # 计算AUC
+    if len(set(all_labels)) > 1:
+        results["auc"] = roc_auc_score(all_labels, all_scores)
+    else:
+        results["auc"] = 0.5
+
+    # 计算F1分数
+    preds = [1 if s > 0.5 else 0 for s in all_scores]
+    results["f1_macro"] = f1_score(all_labels, preds, average="macro", zero_division=0)
+    results["f1_weighted"] = f1_score(
+        all_labels, preds, average="weighted", zero_division=0
+    )
+
+    agent.train()
+    return results
+
+
+def compute_composite_score(results):
+    """
+    计算综合评分用于早停
+
+    加权组合多个指标：
+    - AUC: 30%
+    - MAP@40: 30%
+    - WF1: 20%
+    - F1_Theft: 20% (特别关注窃电类别的召回)
+    """
+    score = (
+        0.3 * results.get("auc", 0)
+        + 0.3 * results.get("map@40", 0)
+        + 0.2 * results.get("wf1", 0)
+        + 0.2 * results.get("f1_theft", 0)
+    )
+    return score
+
+
 def finetune_model(
     model_config_name="MEDIUM",
     epochs=10,
@@ -109,6 +193,10 @@ def finetune_model(
     seed=42,
     use_weighted_sampler=True,
     use_focal_loss=True,
+    encoder_lr_ratio=0.1,  # 编码器学习率相对于整体学习率的比例
+    use_tensorboard=True,
+    eval_every=1,  # 每隔多少个epoch评估一次验证集
+    use_layerwise_lr=True,  # 是否使用分层学习率
 ):
     """
     端到端微调训练
@@ -127,9 +215,20 @@ def finetune_model(
         seed: 随机种子
         use_weighted_sampler: 是否使用加权采样处理类别不平衡
         use_focal_loss: 是否使用Focal Loss
+        encoder_lr_ratio: 编码器学习率比例（分层学习率）
+        use_tensorboard: 是否使用TensorBoard
+        eval_every: 验证集评估频率
+        use_layerwise_lr: 是否使用分层学习率
     """
     # 【修复】设置随机种子
     set_seed(seed)
+
+    # 创建TensorBoard writer
+    writer = None
+    if use_tensorboard:
+        log_dir = f"runs/finetune_{model_config_name}_{int(time.time())}"
+        writer = SummaryWriter(log_dir=log_dir)
+        print(f"[TensorBoard] 日志目录: {log_dir}")
 
     config = getattr(ModelConfig, model_config_name)
 
@@ -252,12 +351,32 @@ def finetune_model(
     print(f"  总数: {total_params:,}")
     print(f"  可训练: {trainable_params:,}\n")
 
-    # 优化器 - 只优化可训练参数
-    optimizer = AdamW(
-        filter(lambda p: p.requires_grad, agent.perception.parameters()),
-        lr=lr,
-        weight_decay=0.01,
-    )
+    # 【优化】分层学习率：编码器使用较小学习率，融合层使用标准学习率
+    if use_layerwise_lr and not freeze_encoder:
+        param_groups = [
+            {
+                "params": agent.perception.numerical_stream.parameters(),
+                "lr": lr * encoder_lr_ratio,  # 编码器学习率较小
+                "name": "encoder",
+            },
+            {
+                "params": agent.perception.fusion.parameters(),
+                "lr": lr,  # 融合层使用标准学习率
+                "name": "fusion",
+            },
+        ]
+        optimizer = AdamW(param_groups, weight_decay=0.01)
+        print(
+            f"✓ 使用分层学习率: encoder_lr={lr * encoder_lr_ratio:.2e}, fusion_lr={lr:.2e}"
+        )
+    else:
+        # 优化器 - 只优化可训练参数
+        optimizer = AdamW(
+            filter(lambda p: p.requires_grad, agent.perception.parameters()),
+            lr=lr,
+            weight_decay=0.01,
+        )
+        print(f"✓ 使用统一学习率: lr={lr:.2e}")
 
     # 学习率调度
     from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
